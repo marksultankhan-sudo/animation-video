@@ -80,6 +80,8 @@ CONFIG = {
     "front_blend": (0.08, 0.42),   # -normal.y range where photo fades into backfill
     "condensation_bump": 0.22,
     "cap_color": "#FFC400",
+    # silhouette shots: label colour x tint (linear), part of the self-glow kept, stronger rim glow
+    "silhouette": {"tint": (0.36, 0.17, 0.06), "emission": 0.6, "glow": 1.8},
     "pet_tint": "#FFF6E8",
 
     # --- palette (top colour, bottom colour) -------------------------------------
@@ -99,7 +101,8 @@ CONFIG = {
         "passion": {"image": "hivit_passionfruit.png", "palette": "passion", "props": "passion"},
         "seabuck": {"image": "hivit_seabuckthorn.png", "palette": "seabuck", "props": "seabuck"},
     },
-    "logo_crop": {"image": "hivit_orange.png", "box": (255, 765, 640, 1078)},  # px in source photo
+    "logo_crop": {"image": "hivit_orange.png", "box": (248, 730, 652, 1115),   # px in source photo
+                  "core": (262, 765, 625, 1080)},  # a shape belongs to the logo if its centre is in here
     "logo_stroke": {"px": 7, "alpha": 0.85, "color": "#4A1A00"},
 
     # --- lights (W) ---------------------------------------------------------------
@@ -204,7 +207,9 @@ CONFIG = {
                  "size": 138, "y": 250, "line_gap": -22, "color": "#FFFFFF", "max_width": 980,
                  "shadow": {"offset": (0, 10), "blur": 18, "alpha": 0.45, "color": "#7A2400"}},
     "headline_logo": {"start": 17.0, "fade": 0.4, "width": 175, "y": 640},
-    "post": {"bloom": 0.22, "bloom_threshold": 0.78, "bloom_radius": 0.018, "vignette": 0.18},
+    "post": {"bloom": 0.22, "bloom_threshold": 0.78, "bloom_radius": 0.018, "vignette": 0.12,
+             "brightness": 1.05, "contrast": 1.08, "saturation": 1.15,
+             "sharpen": {"radius": 1.6, "percent": 85, "threshold": 2}},   # radius in 1080p px
     "encode": {"crf": 18, "preset": "slow", "audio_bitrate": "192k", "audio_fade": 1.0},
 }
 
@@ -359,8 +364,11 @@ def make_logo(cfg):
     lab, n = ndimage.label(ndimage.binary_dilation(m, iterations=2))
     sizes = ndimage.sum(m, lab, range(1, n + 1))
     keep = np.zeros_like(m)
-    for i, s in enumerate(sizes):
-        if s > 0.004 * m.size:
+    cx0, cy0, cx1, cy1 = cfg["logo_crop"]["core"]
+    cents = ndimage.center_of_mass(m, lab, range(1, n + 1))
+    for i, (s, (cy, cx)) in enumerate(zip(sizes, cents)):
+        sx, sy = cx - pad + bx[0], cy - pad + bx[1]          # centre in source-photo pixels
+        if s > 0.003 * m.size and cx0 <= sx <= cx1 and cy0 <= sy <= cy1:
             keep |= lab == i + 1
     a = a * ndimage.binary_dilation(keep, iterations=2)
     # knock-out version: dark letters -> white, keep the red smile
@@ -807,14 +815,15 @@ def mat_label(cfg, key, info, geo):
     w = nb.math("MULTIPLY", wf, img.outputs["Alpha"])
     base = nb.mix(w, back.outputs["Color"], img.outputs["Color"])
     sil = nb.value("SIL", 0.0).outputs[0]
-    dark = nb.mix(sil, base, (0.012, 0.008, 0.004))
+    dark = sil_tint(nb, cfg, sil, base)
     # condensation micro bump on the coat
     vor = nb.node("ShaderNodeTexVoronoi", feature="F1", inputs={"Scale": 160.0, "Randomness": 1.0})
     nb.link(tc.outputs["Object"], vor.inputs["Vector"])
     hgt = nb.maprange(vor.outputs["Distance"], 0.0, 0.42, 1.0, 0.0)
     bump = nb.node("ShaderNodeBump", inputs={"Strength": cfg["condensation_bump"], "Distance": 0.002})
     nb.link(hgt, bump.inputs["Height"])
-    emis = nb.math("MULTIPLY", nb.math("SUBTRACT", 1.0, sil), cfg["label_emission"])
+    emis = nb.math("MULTIPLY", nb.math("MULTIPLY_ADD", sil, cfg["silhouette"]["emission"] - 1.0, 1.0),
+                   cfg["label_emission"])
     # taper the coat at grazing angles: soft glowing rims instead of a clipped white outline
     lwc = nb.node("ShaderNodeLayerWeight", inputs={"Blend": 0.5})
     a0, a1, keep = cfg["coat_grazing"]
@@ -827,11 +836,12 @@ def mat_label(cfg, key, info, geo):
                            "Specular IOR Level": 0.35, "Coat Weight": coat_w,
                            "Coat Roughness": cfg["coat_roughness"], "Coat IOR": 1.52,
                            "Coat Normal": bump.outputs["Normal"],
-                           "Emission Color": base, "Emission Strength": emis})
+                           "Emission Color": dark, "Emission Strength": emis})
     # juice glow at grazing angles (backlit liquid look)
     lw = nb.node("ShaderNodeLayerWeight", inputs={"Blend": 0.35})
     edge = nb.math("POWER", lw.outputs["Facing"], 2.2)
-    glow_amt = nb.math("MULTIPLY", edge, nb.math("MULTIPLY_ADD", sil, -0.75 * cfg["edge_glow"], cfg["edge_glow"]))
+    glow_amt = nb.math("MULTIPLY", edge, nb.math("MULTIPLY_ADD", sil, (cfg["silhouette"]["glow"] - 1.0) * cfg["edge_glow"],
+                                                 cfg["edge_glow"]))
     gcol = nb.rgb("GLOW", hex2rgb(pal["glow"]))
     em = nb.node("ShaderNodeEmission")
     nb.link(gcol.outputs[0], em.inputs["Color"])
@@ -849,6 +859,19 @@ def mat_label(cfg, key, info, geo):
     nb.link(clear, mixs.inputs[2])
     output(nb, mixs.outputs[0])
     return m
+
+
+def sil_tint(nb, cfg, sil, color):
+    """Silhouette shots: multiply towards a deep backlit-amber tint (not black)."""
+    nd = nb.node("ShaderNodeMix", data_type="RGBA", blend_type="MULTIPLY")
+    nb.link(sil, sock_id(nd.inputs, "Factor_Float"))
+    a = sock_id(nd.inputs, "A_Color")
+    if hasattr(color, "is_output"):
+        nb.link(color, a)
+    else:
+        a.default_value = (*color, 1.0)
+    sock_id(nd.inputs, "B_Color").default_value = (*cfg["silhouette"]["tint"], 1.0)
+    return sock_id(nd.outputs, "Result_Color")
 
 
 def thin_pet(nb, cfg):
@@ -875,13 +898,13 @@ def mat_droplet():
 def mat_cap(cfg):
     m, nb = new_material("Cap")
     sil = nb.value("SIL", 0.0).outputs[0]
-    col = nb.mix(sil, hex2rgb(cfg["cap_color"]), (0.01, 0.008, 0.002))
+    col = sil_tint(nb, cfg, sil, hex2rgb(cfg["cap_color"]))
     noise = nb.node("ShaderNodeTexNoise", inputs={"Scale": 420.0, "Detail": 2.0})
     bump = nb.node("ShaderNodeBump", inputs={"Strength": 0.04})
     nb.link(noise.outputs["Fac"], bump.inputs["Height"])
     bs = principled(nb, **{"Base Color": col, "Roughness": 0.22, "Coat Weight": 0.7, "Coat Roughness": 0.06,
                            "Normal": bump.outputs["Normal"],
-                           "Emission Color": col, "Emission Strength": nb.math("MULTIPLY", nb.math("SUBTRACT", 1.0, sil), 0.12)})
+                           "Emission Color": col, "Emission Strength": nb.math("MULTIPLY_ADD", sil, 0.25, 0.12)})
     output(nb, bs.outputs[0])
     return m
 
@@ -890,9 +913,8 @@ def mat_juice_top(cfg, key):
     pal = cfg["palettes"][cfg["variants"][key]["palette"]]
     m, nb = new_material(f"JuiceTop_{key}")
     sil = nb.value("SIL", 0.0).outputs[0]
-    col = nb.mix(sil, hex2rgb(pal["glow"]), (0.01, 0.006, 0.002))
-    bs = principled(nb, **{"Base Color": col, "Roughness": 0.05, "Emission Color": col,
-                           "Emission Strength": nb.math("MULTIPLY", nb.math("SUBTRACT", 1.0, sil), 0.6)})
+    col = sil_tint(nb, cfg, sil, hex2rgb(pal["glow"]))
+    bs = principled(nb, **{"Base Color": col, "Roughness": 0.05, "Emission Color": col, "Emission Strength": 0.6})
     output(nb, bs.outputs[0])
     return m
 
@@ -1255,7 +1277,8 @@ def camera_pose(shot, u, k):
 
 def prop_layout(cfg, shot, key, cam_pos, cam_tgt, lens):
     """World anchors for the props of a shot, laid out in the shot's opening frustum."""
-    rng = random.Random(hash((shot["name"], key, cfg["props"]["seed"])) & 0xFFFFFFFF)
+    import zlib
+    rng = random.Random(zlib.crc32(f'{shot["name"]}|{key}|{cfg["props"]["seed"]}'.encode()))  # stable across runs
     fwd = cam_tgt - cam_pos
     focus = np.linalg.norm(fwd)
     fwd /= focus
@@ -1655,7 +1678,15 @@ def post_frame(cfg, img, t):
         yy, xx = np.mgrid[0:h, 0:w]
         d = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 * 0.6 + ((yy - h / 2) / (h / 2)) ** 2)
         arr *= (1 - pc["vignette"] * np.clip(d - 0.55, 0, 1) ** 1.5)[..., None]
-    out = Image.fromarray((arr.clip(0, 1) * 255 + 0.5).astype(np.uint8)).convert("RGBA")
+    out = Image.fromarray((arr.clip(0, 1) * 255 + 0.5).astype(np.uint8))
+    from PIL import ImageEnhance
+    out = ImageEnhance.Brightness(out).enhance(pc["brightness"])
+    out = ImageEnhance.Contrast(out).enhance(pc["contrast"])
+    out = ImageEnhance.Color(out).enhance(pc["saturation"])
+    sh = pc["sharpen"]
+    out = out.filter(ImageFilter.UnsharpMask(radius=max(0.6, sh["radius"] * scale), percent=sh["percent"],
+                                             threshold=sh["threshold"]))
+    out = out.convert("RGBA")
     draw_teaser(cfg, out, t, scale)
     draw_headline(cfg, out, t, scale)
     draw_headline_logo(cfg, out, t, scale)
